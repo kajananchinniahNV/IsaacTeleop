@@ -11,7 +11,8 @@ The `mode` parameter selects the teleoperation scenario and which topics are
 published:
 
   - controller_teleop (default): ee_poses (from controller aim pose), root_twist, root_pose
-  - hand_teleop: ee_poses (from hand tracking wrist), hand (finger joints only), root_twist, root_pose
+  - hand_teleop: ee_poses (from hand tracking wrist), hand (finger joints only),
+                 root_twist, root_pose, and TF transforms for left/right wrists
   - controller_raw: controller_data only
   - full_body: full_body only
 
@@ -22,6 +23,10 @@ Topic names (configurable via parameters):
   - xr_teleop/root_pose (PoseStamped): root pose command (height only)
   - xr_teleop/controller_data (ByteMultiArray): msgpack-encoded controller data
   - xr_teleop/full_body (ByteMultiArray): msgpack-encoded full body tracking data
+
+TF frames published in hand_teleop mode (configurable via parameters):
+  - world_frame -> right_wrist_frame
+  - world_frame -> left_wrist_frame
 """
 
 import math
@@ -32,9 +37,11 @@ import msgpack
 import msgpack_numpy as mnp
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Pose, PoseArray, PoseStamped, TwistStamped
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, TransformStamped, TwistStamped
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from std_msgs.msg import ByteMultiArray
+from tf2_ros import TransformBroadcaster
 
 from isaacteleop.retargeting_engine.deviceio_source_nodes import (
     ControllersSource,
@@ -92,6 +99,27 @@ def _to_pose(position, orientation=None) -> Pose:
         pose.orientation.z = float(orientation[2])
         pose.orientation.w = float(orientation[3])
     return pose
+
+
+def _make_transform(
+    stamp,
+    parent_frame: str,
+    child_frame: str,
+    position: np.ndarray,
+    orientation: np.ndarray,
+) -> TransformStamped:
+    tf = TransformStamped()
+    tf.header.stamp = stamp
+    tf.header.frame_id = parent_frame
+    tf.child_frame_id = child_frame
+    tf.transform.translation.x = float(position[0])
+    tf.transform.translation.y = float(position[1])
+    tf.transform.translation.z = float(position[2])
+    tf.transform.rotation.x = float(orientation[0])
+    tf.transform.rotation.y = float(orientation[1])
+    tf.transform.rotation.z = float(orientation[2])
+    tf.transform.rotation.w = float(orientation[3])
+    return tf
 
 
 # Message builders
@@ -190,6 +218,43 @@ def _build_hand_msg_from_hands(
             msg.poses.append(_to_pose([0.0, 0.0, 0.0]))
 
     return msg
+
+
+def _build_wrist_tfs(
+    left_hand: OptionalTensorGroup,
+    right_hand: OptionalTensorGroup,
+    now,
+    world_frame: str,
+    right_wrist_frame: str,
+    left_wrist_frame: str,
+) -> List[TransformStamped]:
+    """Build TransformStamped messages for the right and left wrist frames."""
+    tfs = []
+    if not right_hand.is_none:
+        positions = np.asarray(right_hand[HandInputIndex.JOINT_POSITIONS])
+        orientations = np.asarray(right_hand[HandInputIndex.JOINT_ORIENTATIONS])
+        tfs.append(
+            _make_transform(
+                now,
+                world_frame,
+                right_wrist_frame,
+                positions[HandJointIndex.WRIST],
+                orientations[HandJointIndex.WRIST],
+            )
+        )
+    if not left_hand.is_none:
+        positions = np.asarray(left_hand[HandInputIndex.JOINT_POSITIONS])
+        orientations = np.asarray(left_hand[HandInputIndex.JOINT_ORIENTATIONS])
+        tfs.append(
+            _make_transform(
+                now,
+                world_frame,
+                left_wrist_frame,
+                positions[HandJointIndex.WRIST],
+                orientations[HandJointIndex.WRIST],
+            )
+        )
+    return tfs
 
 
 def _build_controller_payload(
@@ -294,6 +359,26 @@ class TeleopRos2PublisherNode(Node):
         self.declare_parameter("frame_id", "world")
         self.declare_parameter("rate_hz", 60.0)
         self.declare_parameter("mode", "controller_teleop")
+        self.declare_parameter(
+            "world_frame",
+            "world",
+            ParameterDescriptor(
+                description=(
+                    "Parent frame for wrist TF transforms (hand_teleop mode only). "
+                    "Defaults to 'world'."
+                )
+            ),
+        )
+        self.declare_parameter(
+            "right_wrist_frame",
+            "right_wrist",
+            ParameterDescriptor(description="TF child frame name for the right wrist."),
+        )
+        self.declare_parameter(
+            "left_wrist_frame",
+            "left_wrist",
+            ParameterDescriptor(description="TF child frame name for the left wrist."),
+        )
 
         self._hand_topic = (
             self.get_parameter("hand_topic").get_parameter_value().string_value
@@ -326,6 +411,17 @@ class TeleopRos2PublisherNode(Node):
                 f"Parameter 'mode' must be one of {_TELEOP_MODES}, got {mode!r}"
             )
         self._mode = mode
+        self._world_frame = (
+            self.get_parameter("world_frame").get_parameter_value().string_value
+        )
+        self._right_wrist_frame = (
+            self.get_parameter("right_wrist_frame").get_parameter_value().string_value
+        )
+        self._left_wrist_frame = (
+            self.get_parameter("left_wrist_frame").get_parameter_value().string_value
+        )
+
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         self._pub_hand = self.create_publisher(PoseArray, self._hand_topic, 10)
         self._pub_ee_pose = self.create_publisher(PoseArray, self._ee_pose_topic, 10)
@@ -398,6 +494,16 @@ class TeleopRos2PublisherNode(Node):
                             )
                             if ee_msg.poses:
                                 self._pub_ee_pose.publish(ee_msg)
+                            wrist_tfs = _build_wrist_tfs(
+                                left_hand,
+                                right_hand,
+                                now,
+                                self._world_frame,
+                                self._right_wrist_frame,
+                                self._left_wrist_frame,
+                            )
+                            if wrist_tfs:
+                                self._tf_broadcaster.sendTransform(wrist_tfs)
                         elif self._mode == "controller_teleop":
                             ee_msg = _build_ee_msg_from_controllers(
                                 left_ctrl, right_ctrl, now, self._frame_id
