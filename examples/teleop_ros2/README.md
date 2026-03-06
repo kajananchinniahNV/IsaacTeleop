@@ -26,9 +26,10 @@ NV_CXR_ENABLE_PUSH_DEVICES=0
 ## Published Topics
 
 - `xr_teleop/hand` (`geometry_msgs/PoseArray`)
-  - `poses[0]`: Right hand wrist pose (if active)
-  - `poses[1]`: Left hand wrist pose (if active)
-  - `poses[2+]`: Finger joint poses (all joints except palm/wrist, right then left)
+  - `poses`: Finger joint poses (all joints except palm/wrist, right then left)
+- `xr_teleop/ee_poses` (`geometry_msgs/PoseArray`)
+  - `poses[0]`: Right hand/controller EE pose (if active)
+  - `poses[1]`: Left hand/controller EE pose (if active)
 - `xr_teleop/root_twist` (`geometry_msgs/TwistStamped`)
 - `xr_teleop/root_pose` (`geometry_msgs/PoseStamped`)
 - `xr_teleop/controller_data` (`std_msgs/ByteMultiArray`, msgpack-encoded dictionary)
@@ -79,7 +80,20 @@ docker run --rm --net=host --ipc=host \
   teleop_ros2_ref --ros-args -p frame_id:=odom -p rate_hz:=30.0
 ```
 
-Available parameters: `hand_topic`, `twist_topic`, `pose_topic`, `controller_topic`, `full_body_topic`, `frame_id`, `rate_hz`, `use_mock_operators`. Use `ros2 param list /teleop_ros2_publisher` and `ros2 param describe /teleop_ros2_publisher <param>` (with the node running) for the full set.
+Available parameters: `hand_topic`, `ee_pose_topic`, `root_twist_topic`, `root_pose_topic`, `controller_topic`, `full_body_topic`, `frame_id`, `rate_hz`, `mode`. Use `ros2 param list /teleop_ros2_publisher` and `ros2 param describe /teleop_ros2_publisher <param>` (with the node running) for the full set.
+
+### Mode
+
+The `mode` parameter selects the teleoperation scenario and which topics are published:
+
+| Mode | Topics published |
+|------|------------------|
+| `controller_teleop` (default) | `ee_poses` (from controller aim pose), `root_twist`, `root_pose` |
+| `hand_teleop` | `ee_poses` (from hand tracking wrist), `hand` (finger joints only), `root_twist`, `root_pose` |
+| `controller_raw` | `controller_data` only |
+| `full_body` | `full_body` only |
+
+Example: `--ros-args -p mode:=controller_raw`
 
 ## Echo Topics
 
@@ -87,6 +101,7 @@ Available parameters: `hand_topic`, `twist_topic`, `pose_topic`, `controller_top
 docker exec -it teleop_ros2_ref /bin/bash
 
 ros2 topic echo /xr_teleop/hand geometry_msgs/msg/PoseArray
+ros2 topic echo /xr_teleop/ee_poses geometry_msgs/msg/PoseArray
 ros2 topic echo /xr_teleop/root_twist geometry_msgs/msg/TwistStamped
 ros2 topic echo /xr_teleop/root_pose geometry_msgs/msg/PoseStamped
 ros2 topic echo /xr_teleop/controller_data std_msgs/msg/ByteMultiArray

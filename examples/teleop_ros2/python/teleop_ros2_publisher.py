@@ -6,8 +6,18 @@
 """
 Teleop ROS2 Reference Publisher.
 
-Publishes teleoperation data over ROS2 topics using isaacteleop TeleopSession:
-  - xr_teleop/hand (PoseArray): [right_wrist, left_wrist, finger_joint_poses...]
+Publishes teleoperation data over ROS2 topics using isaacteleop TeleopSession.
+The `mode` parameter selects the teleoperation scenario and which topics are
+published:
+
+  - controller_teleop (default): ee_poses (from controller aim pose), root_twist, root_pose
+  - hand_teleop: ee_poses (from hand tracking wrist), hand (finger joints only), root_twist, root_pose
+  - controller_raw: controller_data only
+  - full_body: full_body only
+
+Topic names (configurable via parameters):
+  - xr_teleop/hand (PoseArray): [finger_joint_poses...]
+  - xr_teleop/ee_poses (PoseArray): [right_ee, left_ee]
   - xr_teleop/root_twist (TwistStamped): root velocity command
   - xr_teleop/root_pose (PoseStamped): root pose command (height only)
   - xr_teleop/controller_data (ByteMultiArray): msgpack-encoded controller data
@@ -15,9 +25,7 @@ Publishes teleoperation data over ROS2 topics using isaacteleop TeleopSession:
 """
 
 import math
-import os
 import time
-from pathlib import Path
 from typing import Dict, List
 
 import msgpack
@@ -51,15 +59,137 @@ from isaacteleop.teleop_session_manager import (
     TeleopSessionConfig,
 )
 
+_BODY_JOINT_NAMES = [e.name for e in BodyJointPicoIndex]
+_TELEOP_MODES = ("controller_teleop", "hand_teleop", "controller_raw", "full_body")
 
-def _find_plugins_dirs(start: Path) -> List[Path]:
-    candidates = []
-    for parent in [start] + list(start.parents):
-        plugin_dir = parent / "plugins"
-        if plugin_dir.is_dir():
-            candidates.append(plugin_dir)
-            break
-    return candidates
+
+# Helper functions
+
+
+def _append_hand_poses(
+    poses: List[Pose],
+    joint_positions: np.ndarray,
+    joint_orientations: np.ndarray,
+) -> None:
+    for joint_idx in range(
+        HandJointIndex.THUMB_METACARPAL, HandJointIndex.LITTLE_TIP + 1
+    ):
+        poses.append(
+            _to_pose(joint_positions[joint_idx], joint_orientations[joint_idx])
+        )
+
+
+def _to_pose(position, orientation=None) -> Pose:
+    pose = Pose()
+    pose.position.x = float(position[0])
+    pose.position.y = float(position[1])
+    pose.position.z = float(position[2])
+    if orientation is None:
+        pose.orientation.w = 1.0
+    else:
+        pose.orientation.x = float(orientation[0])
+        pose.orientation.y = float(orientation[1])
+        pose.orientation.z = float(orientation[2])
+        pose.orientation.w = float(orientation[3])
+    return pose
+
+
+# Message builders
+
+
+def _build_ee_msg_from_controllers(
+    left_ctrl: OptionalTensorGroup,
+    right_ctrl: OptionalTensorGroup,
+    now,
+    frame_id: str,
+) -> PoseArray:
+    """Build a PoseArray with right then left controller aim poses (wrist proxy)."""
+    msg = PoseArray()
+    msg.header.stamp = now
+    msg.header.frame_id = frame_id
+    if not right_ctrl.is_none:
+        pos = [float(x) for x in right_ctrl[ControllerInputIndex.AIM_POSITION]]
+        ori = [float(x) for x in right_ctrl[ControllerInputIndex.AIM_ORIENTATION]]
+        msg.poses.append(_to_pose(pos, ori))
+    else:
+        msg.poses.append(_to_pose([0.0, 0.0, 0.0]))
+
+    if not left_ctrl.is_none:
+        pos = [float(x) for x in left_ctrl[ControllerInputIndex.AIM_POSITION]]
+        ori = [float(x) for x in left_ctrl[ControllerInputIndex.AIM_ORIENTATION]]
+        msg.poses.append(_to_pose(pos, ori))
+    else:
+        msg.poses.append(_to_pose([0.0, 0.0, 0.0]))
+
+    return msg
+
+
+def _build_ee_msg_from_hands(
+    left_hand: OptionalTensorGroup,
+    right_hand: OptionalTensorGroup,
+    now,
+    frame_id: str,
+) -> PoseArray:
+    """Build a PoseArray with right then left hand wrist poses (EE proxy)."""
+    msg = PoseArray()
+    msg.header.stamp = now
+    msg.header.frame_id = frame_id
+
+    if not right_hand.is_none:
+        right_positions = np.asarray(right_hand[HandInputIndex.JOINT_POSITIONS])
+        right_orientations = np.asarray(right_hand[HandInputIndex.JOINT_ORIENTATIONS])
+        msg.poses.append(
+            _to_pose(
+                right_positions[HandJointIndex.WRIST],
+                right_orientations[HandJointIndex.WRIST],
+            )
+        )
+    else:
+        msg.poses.append(_to_pose([0.0, 0.0, 0.0]))
+
+    if not left_hand.is_none:
+        left_positions = np.asarray(left_hand[HandInputIndex.JOINT_POSITIONS])
+        left_orientations = np.asarray(left_hand[HandInputIndex.JOINT_ORIENTATIONS])
+        msg.poses.append(
+            _to_pose(
+                left_positions[HandJointIndex.WRIST],
+                left_orientations[HandJointIndex.WRIST],
+            )
+        )
+    else:
+        msg.poses.append(_to_pose([0.0, 0.0, 0.0]))
+
+    return msg
+
+
+def _build_hand_msg_from_hands(
+    left_hand: OptionalTensorGroup,
+    right_hand: OptionalTensorGroup,
+    now,
+    frame_id: str,
+) -> PoseArray:
+    """Build a PoseArray with right then left hand finger joints."""
+    msg = PoseArray()
+    msg.header.stamp = now
+    msg.header.frame_id = frame_id
+
+    if not right_hand.is_none:
+        right_positions = np.asarray(right_hand[HandInputIndex.JOINT_POSITIONS])
+        right_orientations = np.asarray(right_hand[HandInputIndex.JOINT_ORIENTATIONS])
+        _append_hand_poses(msg.poses, right_positions, right_orientations)
+    else:
+        for _ in range(HandJointIndex.THUMB_METACARPAL, HandJointIndex.LITTLE_TIP + 1):
+            msg.poses.append(_to_pose([0.0, 0.0, 0.0]))
+
+    if not left_hand.is_none:
+        left_positions = np.asarray(left_hand[HandInputIndex.JOINT_POSITIONS])
+        left_orientations = np.asarray(left_hand[HandInputIndex.JOINT_ORIENTATIONS])
+        _append_hand_poses(msg.poses, left_positions, left_orientations)
+    else:
+        for _ in range(HandJointIndex.THUMB_METACARPAL, HandJointIndex.LITTLE_TIP + 1):
+            msg.poses.append(_to_pose([0.0, 0.0, 0.0]))
+
+    return msg
 
 
 def _build_controller_payload(
@@ -135,9 +265,6 @@ def _build_controller_payload(
     }
 
 
-_BODY_JOINT_NAMES = [e.name for e in BodyJointPicoIndex]
-
-
 def _build_full_body_payload(full_body: OptionalTensorGroup) -> Dict:
     positions = np.asarray(full_body[FullBodyInputIndex.JOINT_POSITIONS])
     orientations = np.asarray(full_body[FullBodyInputIndex.JOINT_ORIENTATIONS])
@@ -152,34 +279,6 @@ def _build_full_body_payload(full_body: OptionalTensorGroup) -> Dict:
     }
 
 
-def _to_pose(position, orientation=None) -> Pose:
-    pose = Pose()
-    pose.position.x = float(position[0])
-    pose.position.y = float(position[1])
-    pose.position.z = float(position[2])
-    if orientation is None:
-        pose.orientation.w = 1.0
-    else:
-        pose.orientation.x = float(orientation[0])
-        pose.orientation.y = float(orientation[1])
-        pose.orientation.z = float(orientation[2])
-        pose.orientation.w = float(orientation[3])
-    return pose
-
-
-def _append_hand_poses(
-    poses: List[Pose],
-    joint_positions: np.ndarray,
-    joint_orientations: np.ndarray,
-) -> None:
-    for joint_idx in range(
-        HandJointIndex.THUMB_METACARPAL, HandJointIndex.LITTLE_TIP + 1
-    ):
-        poses.append(
-            _to_pose(joint_positions[joint_idx], joint_orientations[joint_idx])
-        )
-
-
 class TeleopRos2PublisherNode(Node):
     """ROS 2 node that publishes teleop data to configurable topics."""
 
@@ -187,22 +286,26 @@ class TeleopRos2PublisherNode(Node):
         super().__init__("teleop_ros2_publisher")
 
         self.declare_parameter("hand_topic", "xr_teleop/hand")
-        self.declare_parameter("twist_topic", "xr_teleop/root_twist")
-        self.declare_parameter("pose_topic", "xr_teleop/root_pose")
+        self.declare_parameter("ee_pose_topic", "xr_teleop/ee_poses")
+        self.declare_parameter("root_twist_topic", "xr_teleop/root_twist")
+        self.declare_parameter("root_pose_topic", "xr_teleop/root_pose")
         self.declare_parameter("controller_topic", "xr_teleop/controller_data")
         self.declare_parameter("full_body_topic", "xr_teleop/full_body")
         self.declare_parameter("frame_id", "world")
         self.declare_parameter("rate_hz", 60.0)
-        self.declare_parameter("use_mock_operators", value=False)
+        self.declare_parameter("mode", "controller_teleop")
 
         self._hand_topic = (
             self.get_parameter("hand_topic").get_parameter_value().string_value
         )
-        self._twist_topic = (
-            self.get_parameter("twist_topic").get_parameter_value().string_value
+        self._ee_pose_topic = (
+            self.get_parameter("ee_pose_topic").get_parameter_value().string_value
         )
-        self._pose_topic = (
-            self.get_parameter("pose_topic").get_parameter_value().string_value
+        self._root_twist_topic = (
+            self.get_parameter("root_twist_topic").get_parameter_value().string_value
+        )
+        self._root_pose_topic = (
+            self.get_parameter("root_pose_topic").get_parameter_value().string_value
         )
         self._controller_topic = (
             self.get_parameter("controller_topic").get_parameter_value().string_value
@@ -217,13 +320,21 @@ class TeleopRos2PublisherNode(Node):
         if rate_hz <= 0 or not math.isfinite(rate_hz):
             raise ValueError("Parameter 'rate_hz' must be > 0")
         self._sleep_period_s = 1.0 / rate_hz
-        self._use_mock_operators = (
-            self.get_parameter("use_mock_operators").get_parameter_value().bool_value
-        )
+        mode = self.get_parameter("mode").get_parameter_value().string_value
+        if mode not in _TELEOP_MODES:
+            raise ValueError(
+                f"Parameter 'mode' must be one of {_TELEOP_MODES}, got {mode!r}"
+            )
+        self._mode = mode
 
         self._pub_hand = self.create_publisher(PoseArray, self._hand_topic, 10)
-        self._pub_twist = self.create_publisher(TwistStamped, self._twist_topic, 10)
-        self._pub_pose = self.create_publisher(PoseStamped, self._pose_topic, 10)
+        self._pub_ee_pose = self.create_publisher(PoseArray, self._ee_pose_topic, 10)
+        self._pub_root_twist = self.create_publisher(
+            TwistStamped, self._root_twist_topic, 10
+        )
+        self._pub_root_pose = self.create_publisher(
+            PoseStamped, self._root_pose_topic, 10
+        )
         self._pub_controller = self.create_publisher(
             ByteMultiArray, self._controller_topic, 10
         )
@@ -256,19 +367,6 @@ class TeleopRos2PublisherNode(Node):
         )
 
         plugins: List[PluginConfig] = []
-        if self._use_mock_operators:
-            plugin_paths = []
-            env_paths = os.environ.get("ISAAC_TELEOP_PLUGIN_PATH")
-            if env_paths:
-                plugin_paths.extend([Path(p) for p in env_paths.split(os.pathsep) if p])
-            plugin_paths.extend(_find_plugins_dirs(Path(__file__).resolve()))
-            plugins.append(
-                PluginConfig(
-                    plugin_name="controller_synthetic_hands",
-                    plugin_root_id="synthetic_hands",
-                    search_paths=plugin_paths,
-                )
-            )
 
         self._config = TeleopSessionConfig(
             app_name="TeleopRos2Publisher",
@@ -284,114 +382,73 @@ class TeleopRos2PublisherNode(Node):
                         result = session.step()
 
                         now = self.get_clock().now().to_msg()
-                        hand_msg = PoseArray()
-                        hand_msg.header.stamp = now
-                        hand_msg.header.frame_id = self._frame_id
-
-                        left_hand = result["hand_left"]
-                        right_hand = result["hand_right"]
                         left_ctrl = result["controller_left"]
                         right_ctrl = result["controller_right"]
 
-                        if not right_hand.is_none:
-                            right_positions = np.asarray(
-                                right_hand[HandInputIndex.JOINT_POSITIONS]
+                        if self._mode == "hand_teleop":
+                            left_hand = result["hand_left"]
+                            right_hand = result["hand_right"]
+                            hand_msg = _build_hand_msg_from_hands(
+                                left_hand, right_hand, now, self._frame_id
                             )
-                            right_orientations = np.asarray(
-                                right_hand[HandInputIndex.JOINT_ORIENTATIONS]
+                            if hand_msg.poses:
+                                self._pub_hand.publish(hand_msg)
+                            ee_msg = _build_ee_msg_from_hands(
+                                left_hand, right_hand, now, self._frame_id
                             )
-                            hand_msg.poses.append(
-                                _to_pose(
-                                    right_positions[HandJointIndex.WRIST],
-                                    right_orientations[HandJointIndex.WRIST],
+                            if ee_msg.poses:
+                                self._pub_ee_pose.publish(ee_msg)
+                        elif self._mode == "controller_teleop":
+                            ee_msg = _build_ee_msg_from_controllers(
+                                left_ctrl, right_ctrl, now, self._frame_id
+                            )
+                            if ee_msg.poses:
+                                self._pub_ee_pose.publish(ee_msg)
+
+                        if self._mode in ("hand_teleop", "controller_teleop"):
+                            root_command = result.get("root_command")
+                            if not root_command.is_none:
+                                cmd = np.asarray(root_command[0])
+                                twist_msg = TwistStamped()
+                                twist_msg.header.stamp = now
+                                twist_msg.header.frame_id = self._frame_id
+                                twist_msg.twist.linear.x = float(cmd[0])
+                                twist_msg.twist.linear.y = float(cmd[1])
+                                twist_msg.twist.linear.z = 0.0
+                                twist_msg.twist.angular.z = float(cmd[2])
+                                self._pub_root_twist.publish(twist_msg)
+
+                                pose_msg = PoseStamped()
+                                pose_msg.header.stamp = now
+                                pose_msg.header.frame_id = self._frame_id
+                                pose_msg.pose.position.z = float(cmd[3])
+                                pose_msg.pose.orientation.w = 1.0
+                                self._pub_root_pose.publish(pose_msg)
+
+                        if self._mode == "controller_raw":
+                            if not left_ctrl.is_none or not right_ctrl.is_none:
+                                controller_payload = _build_controller_payload(
+                                    left_ctrl, right_ctrl
                                 )
-                            )
-                        elif not right_ctrl.is_none:
-                            hand_msg.poses.append(
-                                _to_pose(
-                                    np.asarray(
-                                        right_ctrl[ControllerInputIndex.AIM_POSITION]
-                                    ),
-                                    np.asarray(
-                                        right_ctrl[ControllerInputIndex.AIM_ORIENTATION]
-                                    ),
+                                payload = msgpack.packb(
+                                    controller_payload, default=mnp.encode
                                 )
-                            )
-                        if not left_hand.is_none:
-                            left_positions = np.asarray(
-                                left_hand[HandInputIndex.JOINT_POSITIONS]
-                            )
-                            left_orientations = np.asarray(
-                                left_hand[HandInputIndex.JOINT_ORIENTATIONS]
-                            )
-                            hand_msg.poses.append(
-                                _to_pose(
-                                    left_positions[HandJointIndex.WRIST],
-                                    left_orientations[HandJointIndex.WRIST],
+                                payload = tuple(bytes([a]) for a in payload)
+                                controller_msg = ByteMultiArray()
+                                controller_msg.data = payload
+                                self._pub_controller.publish(controller_msg)
+
+                        if self._mode == "full_body":
+                            full_body_data = result["full_body"]
+                            if not full_body_data.is_none:
+                                body_payload = _build_full_body_payload(full_body_data)
+                                payload = msgpack.packb(
+                                    body_payload, default=mnp.encode
                                 )
-                            )
-                        elif not left_ctrl.is_none:
-                            hand_msg.poses.append(
-                                _to_pose(
-                                    np.asarray(
-                                        left_ctrl[ControllerInputIndex.AIM_POSITION]
-                                    ),
-                                    np.asarray(
-                                        left_ctrl[ControllerInputIndex.AIM_ORIENTATION]
-                                    ),
-                                )
-                            )
-
-                        if not right_hand.is_none:
-                            _append_hand_poses(
-                                hand_msg.poses, right_positions, right_orientations
-                            )
-                        if not left_hand.is_none:
-                            _append_hand_poses(
-                                hand_msg.poses, left_positions, left_orientations
-                            )
-
-                        if hand_msg.poses:
-                            self._pub_hand.publish(hand_msg)
-
-                        root_command = result["root_command"]
-                        cmd = np.asarray(root_command[0])
-                        twist_msg = TwistStamped()
-                        twist_msg.header.stamp = now
-                        twist_msg.header.frame_id = self._frame_id
-                        twist_msg.twist.linear.x = float(cmd[0])
-                        twist_msg.twist.linear.y = float(cmd[1])
-                        twist_msg.twist.linear.z = 0.0
-                        twist_msg.twist.angular.z = float(cmd[2])
-                        self._pub_twist.publish(twist_msg)
-
-                        pose_msg = PoseStamped()
-                        pose_msg.header.stamp = now
-                        pose_msg.header.frame_id = self._frame_id
-                        pose_msg.pose.position.z = float(cmd[3])
-                        pose_msg.pose.orientation.w = 1.0
-                        self._pub_pose.publish(pose_msg)
-
-                        if not left_ctrl.is_none or not right_ctrl.is_none:
-                            controller_payload = _build_controller_payload(
-                                left_ctrl, right_ctrl
-                            )
-                            payload = msgpack.packb(
-                                controller_payload, default=mnp.encode
-                            )
-                            payload = tuple(bytes([a]) for a in payload)
-                            controller_msg = ByteMultiArray()
-                            controller_msg.data = payload
-                            self._pub_controller.publish(controller_msg)
-
-                        full_body_data = result["full_body"]
-                        if not full_body_data.is_none:
-                            body_payload = _build_full_body_payload(full_body_data)
-                            payload = msgpack.packb(body_payload, default=mnp.encode)
-                            payload = tuple(bytes([a]) for a in payload)
-                            body_msg = ByteMultiArray()
-                            body_msg.data = payload
-                            self._pub_full_body.publish(body_msg)
+                                payload = tuple(bytes([a]) for a in payload)
+                                body_msg = ByteMultiArray()
+                                body_msg.data = payload
+                                self._pub_full_body.publish(body_msg)
 
                         time.sleep(self._sleep_period_s)
             except RuntimeError as e:
