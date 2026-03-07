@@ -32,7 +32,7 @@ TF frames published in hand_teleop and controller_teleop modes (configurable via
 
 import math
 import time
-from typing import Dict, List
+from typing import Dict, List, Sequence, Union
 
 import msgpack
 import msgpack_numpy as mnp
@@ -112,8 +112,8 @@ def _make_transform(
     stamp,
     parent_frame: str,
     child_frame: str,
-    position: np.ndarray,
-    orientation: np.ndarray,
+    position: Union[np.ndarray, Sequence[float]],
+    orientation: Union[np.ndarray, Sequence[float]],
 ) -> TransformStamped:
     tf = TransformStamped()
     tf.header.stamp = stamp
@@ -447,6 +447,24 @@ class TeleopRos2PublisherNode(Node):
         self._left_wrist_frame = (
             self.get_parameter("left_wrist_frame").get_parameter_value().string_value
         )
+        if not self._world_frame:
+            raise ValueError("Parameter 'world_frame' must not be empty")
+        if not self._right_wrist_frame:
+            raise ValueError("Parameter 'right_wrist_frame' must not be empty")
+        if not self._left_wrist_frame:
+            raise ValueError("Parameter 'left_wrist_frame' must not be empty")
+        if self._right_wrist_frame == self._left_wrist_frame:
+            raise ValueError(
+                f"'right_wrist_frame' and 'left_wrist_frame' must be different , got {self._right_wrist_frame!r}"
+            )
+        if self._right_wrist_frame == self._world_frame:
+            raise ValueError(
+                f"'right_wrist_frame' must be different from 'world_frame', got {self._right_wrist_frame!r}"
+            )
+        if self._left_wrist_frame == self._world_frame:
+            raise ValueError(
+                f"'left_wrist_frame' must be different from 'world_frame', got {self._left_wrist_frame!r}"
+            )
 
         self._tf_broadcaster = TransformBroadcaster(self)
 
