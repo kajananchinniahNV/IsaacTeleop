@@ -228,60 +228,48 @@ def _build_hand_msg_from_hands(
 
 
 def _build_wrist_tfs(
-    left_hand: OptionalTensorGroup,
-    right_hand: OptionalTensorGroup,
+    ee_msg: PoseArray,
+    right_available: bool,
+    left_available: bool,
     now,
     world_frame: str,
     right_wrist_frame: str,
     left_wrist_frame: str,
 ) -> List[TransformStamped]:
-    """Build TransformStamped messages for the right and left wrist frames."""
+    """Build wrist TF transforms from a pre-built ee_poses PoseArray (right pose at index 0, left at index 1)."""
     tfs = []
-    if not right_hand.is_none:
-        positions = np.asarray(right_hand[HandInputIndex.JOINT_POSITIONS])
-        orientations = np.asarray(right_hand[HandInputIndex.JOINT_ORIENTATIONS])
+    if right_available:
+        pose = ee_msg.poses[0]
         tfs.append(
             _make_transform(
                 now,
                 world_frame,
                 right_wrist_frame,
-                positions[HandJointIndex.WRIST],
-                orientations[HandJointIndex.WRIST],
+                [pose.position.x, pose.position.y, pose.position.z],
+                [
+                    pose.orientation.x,
+                    pose.orientation.y,
+                    pose.orientation.z,
+                    pose.orientation.w,
+                ],
             )
         )
-    if not left_hand.is_none:
-        positions = np.asarray(left_hand[HandInputIndex.JOINT_POSITIONS])
-        orientations = np.asarray(left_hand[HandInputIndex.JOINT_ORIENTATIONS])
+    if left_available:
+        pose = ee_msg.poses[1]
         tfs.append(
             _make_transform(
                 now,
                 world_frame,
                 left_wrist_frame,
-                positions[HandJointIndex.WRIST],
-                orientations[HandJointIndex.WRIST],
+                [pose.position.x, pose.position.y, pose.position.z],
+                [
+                    pose.orientation.x,
+                    pose.orientation.y,
+                    pose.orientation.z,
+                    pose.orientation.w,
+                ],
             )
         )
-    return tfs
-
-
-def _build_wrist_tfs_from_controllers(
-    left_ctrl: OptionalTensorGroup,
-    right_ctrl: OptionalTensorGroup,
-    now,
-    world_frame: str,
-    right_wrist_frame: str,
-    left_wrist_frame: str,
-) -> List[TransformStamped]:
-    """Build TransformStamped messages for the right and left wrist frames using controller aim poses."""
-    tfs = []
-    if not right_ctrl.is_none:
-        pos = [float(x) for x in right_ctrl[ControllerInputIndex.AIM_POSITION]]
-        ori = [float(x) for x in right_ctrl[ControllerInputIndex.AIM_ORIENTATION]]
-        tfs.append(_make_transform(now, world_frame, right_wrist_frame, pos, ori))
-    if not left_ctrl.is_none:
-        pos = [float(x) for x in left_ctrl[ControllerInputIndex.AIM_POSITION]]
-        ori = [float(x) for x in left_ctrl[ControllerInputIndex.AIM_ORIENTATION]]
-        tfs.append(_make_transform(now, world_frame, left_wrist_frame, pos, ori))
     return tfs
 
 
@@ -384,7 +372,6 @@ class TeleopRos2PublisherNode(Node):
         self.declare_parameter("root_pose_topic", "xr_teleop/root_pose")
         self.declare_parameter("controller_topic", "xr_teleop/controller_data")
         self.declare_parameter("full_body_topic", "xr_teleop/full_body")
-        self.declare_parameter("frame_id", "world")
         self.declare_parameter("rate_hz", 60.0)
         self.declare_parameter("mode", "controller_teleop")
         self.declare_parameter(
@@ -392,7 +379,8 @@ class TeleopRos2PublisherNode(Node):
             "world",
             ParameterDescriptor(
                 description=(
-                    "Parent frame for wrist TF transforms. Defaults to 'world'."
+                    "World frame used as the header frame_id for all published messages "
+                    "and as the parent frame for wrist TF transforms. Defaults to 'world'."
                 )
             ),
         )
@@ -424,9 +412,6 @@ class TeleopRos2PublisherNode(Node):
         )
         self._full_body_topic = (
             self.get_parameter("full_body_topic").get_parameter_value().string_value
-        )
-        self._frame_id = (
-            self.get_parameter("frame_id").get_parameter_value().string_value
         )
         rate_hz = self.get_parameter("rate_hz").get_parameter_value().double_value
         if rate_hz <= 0 or not math.isfinite(rate_hz):
@@ -530,18 +515,19 @@ class TeleopRos2PublisherNode(Node):
                             left_hand = result["hand_left"]
                             right_hand = result["hand_right"]
                             hand_msg = _build_hand_msg_from_hands(
-                                left_hand, right_hand, now, self._frame_id
+                                left_hand, right_hand, now, self._world_frame
                             )
                             if hand_msg.poses:
                                 self._pub_hand.publish(hand_msg)
                             ee_msg = _build_ee_msg_from_hands(
-                                left_hand, right_hand, now, self._frame_id
+                                left_hand, right_hand, now, self._world_frame
                             )
                             if ee_msg.poses:
                                 self._pub_ee_pose.publish(ee_msg)
                             wrist_tfs = _build_wrist_tfs(
-                                left_hand,
-                                right_hand,
+                                ee_msg,
+                                not right_hand.is_none,
+                                not left_hand.is_none,
                                 now,
                                 self._world_frame,
                                 self._right_wrist_frame,
@@ -551,13 +537,14 @@ class TeleopRos2PublisherNode(Node):
                                 self._tf_broadcaster.sendTransform(wrist_tfs)
                         elif self._mode == "controller_teleop":
                             ee_msg = _build_ee_msg_from_controllers(
-                                left_ctrl, right_ctrl, now, self._frame_id
+                                left_ctrl, right_ctrl, now, self._world_frame
                             )
                             if ee_msg.poses:
                                 self._pub_ee_pose.publish(ee_msg)
-                            wrist_tfs = _build_wrist_tfs_from_controllers(
-                                left_ctrl,
-                                right_ctrl,
+                            wrist_tfs = _build_wrist_tfs(
+                                ee_msg,
+                                not right_ctrl.is_none,
+                                not left_ctrl.is_none,
                                 now,
                                 self._world_frame,
                                 self._right_wrist_frame,
@@ -572,7 +559,7 @@ class TeleopRos2PublisherNode(Node):
                                 cmd = np.asarray(root_command[0])
                                 twist_msg = TwistStamped()
                                 twist_msg.header.stamp = now
-                                twist_msg.header.frame_id = self._frame_id
+                                twist_msg.header.frame_id = self._world_frame
                                 twist_msg.twist.linear.x = float(cmd[0])
                                 twist_msg.twist.linear.y = float(cmd[1])
                                 twist_msg.twist.linear.z = 0.0
@@ -581,7 +568,7 @@ class TeleopRos2PublisherNode(Node):
 
                                 pose_msg = PoseStamped()
                                 pose_msg.header.stamp = now
-                                pose_msg.header.frame_id = self._frame_id
+                                pose_msg.header.frame_id = self._world_frame
                                 pose_msg.pose.position.z = float(cmd[3])
                                 pose_msg.pose.orientation.w = 1.0
                                 self._pub_root_pose.publish(pose_msg)
