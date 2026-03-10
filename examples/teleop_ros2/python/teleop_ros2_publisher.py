@@ -623,16 +623,35 @@ class TeleopRos2PublisherNode(Node):
                         if self._mode == "controller_teleop":
                             left_joints = result["finger_joints_left"]
                             right_joints = result["finger_joints_right"]
-                            if not left_joints.is_none and not right_joints.is_none:
+                            if not left_joints.is_none or not right_joints.is_none:
                                 finger_joints_msg = JointState()
                                 finger_joints_msg.header.stamp = now
                                 finger_joints_msg.header.frame_id = self._world_frame
-                                finger_joints_msg.name = _FINGER_JOINT_NAMES
+                                left_arr = (
+                                    np.asarray(list(left_joints), dtype=np.float32)
+                                    if not left_joints.is_none
+                                    else np.array([], dtype=np.float32)
+                                )
+                                right_arr = (
+                                    np.asarray(list(right_joints), dtype=np.float32)
+                                    if not right_joints.is_none
+                                    else np.array([], dtype=np.float32)
+                                )
+                                finger_joints_msg.name = (
+                                    list(
+                                        _FINGER_JOINT_NAMES[: len(_TRIHAND_JOINT_NAMES)]
+                                    )
+                                    if not left_joints.is_none
+                                    else []
+                                ) + (
+                                    list(
+                                        _FINGER_JOINT_NAMES[len(_TRIHAND_JOINT_NAMES) :]
+                                    )
+                                    if not right_joints.is_none
+                                    else []
+                                )
                                 finger_joints_msg.position = np.concatenate(
-                                    [
-                                        np.asarray(left_joints, dtype=np.float32),
-                                        np.asarray(right_joints, dtype=np.float32),
-                                    ]
+                                    [left_arr, right_arr]
                                 ).tolist()
                                 self._pub_finger_joints.publish(finger_joints_msg)
 
